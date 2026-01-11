@@ -17,11 +17,22 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = [
+    "tabulate>=0.9.0",
+    "typer>=0.21.1",
+]
 
 [project.urls]
 Homepage = "https://jahagirdar.github.io/universal-task-sync/"
 Repository = "https://github.com/jahagirdar/universal-task-sync"
 Documentation = "https://jahagirdar.github.io/universal-task-sync/"
+
+[project.entry-points."universal_task_sync.plugins"]
+tw = "uts_tw.plugin:TaskwarriorPlugin"
+json = "uts_json.plugin:JsonPlugin"
+github = "uts_github.plugin:GitHubPlugin"
+[project.scripts]
+uts = "universal_task_sync.cli:app"
 
 [dependency-groups]
 dev = [

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[project]
+name = "uts-tw"
+version = "0.1.0"
+dependencies = ["universal-task-sync"]
+
+[project.entry-points."universal_task_sync.plugins"]
+tw = "uts_tw.plugin:TaskwarriorPlugin"
+[tool.hatch.build.targets.wheel]
+packages = ["src/uts_tw"]
