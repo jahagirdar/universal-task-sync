@@ -3,6 +3,8 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import List
 
+import typer
+
 from universal_task_sync.models import Priority, TaskCIR, TaskStatus
 
 
@@ -90,15 +92,69 @@ class TaskwarriorPlugin:
 
         return {k: v for k, v in tw_dict.items() if v is not None}
 
-    def fetch_raw(self, filter_query: str) -> List[dict]:
+    def fetch_raw(self, target: str) -> List[dict]:
         """IO: Export from Taskwarrior."""
         cmd = ["task", "rc.json.array=on"]
-        if filter_query:
-            cmd.append(filter_query)
+        if target:
+            cmd.append(target)
         cmd.append("export")
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
+
+    def update_task(self, ext_id: str, task: TaskCIR, target: str) -> str:
+        from taskw import TaskWarrior
+
+        w = TaskWarrior()
+
+        # Fetch existing task
+        try:
+            _, tw_task = w.get_task(uuid=ext_id)
+            print(f"{tast=} {tw_task=}")
+        except Exception:
+            typer.secho(f"❌ Taskwarrior task {ext_id} not found.", fg="red")
+            return ext_id
+
+        # 1. Update Allowed Fields
+        tw_task["description"] = task.description
+
+        # Handle Target -> Project (e.g. project:uts -> uts)
+        if target and target.startswith("project:"):
+            tw_task["project"] = target.split(":", 1)[1]
+        # Handle status
+
+        # Handle body/notes (Taskwarrior uses 'annotations')
+        if task.body:
+            # Check if this note already exists to avoid duplicates
+            existing_notes = [a["description"] for a in tw_task.get("annotations", [])]
+            if task.body not in existing_notes:
+                w.task_annotate(ext_id, task.body)
+
+        # 2. CRITICAL: Remove Read-Only Internal Fields
+        # This prevents the "mask", "modified", and "entry" errors
+        protected_fields = [
+            "id",
+            "mask",
+            "urgency",
+            "modified",
+            "entry",
+            "uuid",
+            "status",  # status should be handled via w.task_done() if completed
+        ]
+        for field in protected_fields:
+            tw_task.pop(field, None)
+
+        # 3. Handle Status separately
+        from universal_task_sync.models import TaskStatus
+
+        if task.status == TaskStatus.COMPLETED:
+            w.task_done(uuid=ext_id)
+        else:
+            # Push updates for pending tasks
+            print(f"at end {tast=} {tw_task=}")
+            w.task_update(tw_task)
+
+        return ext_id
 
     def send_raw(self, raw_data: dict):
         """IO: Import into Taskwarrior."""

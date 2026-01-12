@@ -9,122 +9,128 @@ from .config import get_config
 from .db import MappingManager
 from .loader import get_plugin  # Assuming your entry-point loader logic is here
 from .models import TaskCIR
+from .reconciler import reconcile_app
 
 app = typer.Typer(help="Universal Task Sync: Bridge your task managers.")
+app.add_typer(reconcile_app, name="reconcile")
 
 
 @app.command()
 def sync(
-    input_plugin: str = typer.Option(..., "--input", "-i"),
-    output_plugin: str = typer.Option(..., "--output", "-o"),
-    project: str = typer.Option(..., "-project", help="Source project or filter"),
-    target: Optional[str] = typer.Option(None, "--target", "-t", help="Destination identifier"),
+    a_plugin: str = typer.Option(..., "--a_plugin", "-a"),
+    b_plugin: str = typer.Option(..., "--b_plugin", "-b"),
+    a_filter: str = typer.Option(..., "--a_filter", help="a filter"),
+    b_filter: Optional[str] = typer.Option(None, "--b_filter", "-t", help="b filter"),
 ):
     """Sync tasks from a source to a destination with persistent mapping memory."""
     mgr = MappingManager()
 
     # 1. Initialize Plugins
-    src = get_plugin(input_plugin)
-    dst = get_plugin(output_plugin)
+    a = get_plugin(a_plugin)
+    b = get_plugin(b_plugin)
 
     # 2. Resolve Target from History
     # If user didn't provide -t, look in the project_map table
-    if not target:
-        target = mgr.get_stored_target(input_plugin, project, output_plugin)
-        if not target:
-            typer.secho(f"❓ No target history found for {input_plugin}:{project}", fg="yellow")
-            target = typer.prompt(f"Enter the {output_plugin} target (e.g., owner/repo or project:org/num)")
-            mgr.store_project_link(input_plugin, project, output_plugin, target)
+    if not b_filter:
+        b_filter = mgr.get_stored_target(a_plugin, a_filter, b_plugin)
+        if not b_filter:
+            typer.secho(f"❓ No b_filter history found for {a_plugin}:{a_filter}", fg="yellow")
+            b_filter = typer.prompt(f"Enter the {b_plugin} b_filter (e.g., owner/repo or a_filter:org/num)")
+            mgr.store_project_link(a_plugin, a_filter, b_plugin, b_filter)
     else:
         # Save or update the mapping if provided explicitly
-        mgr.store_project_link(input_plugin, project, output_plugin, target)
+        mgr.store_project_link(a_plugin, a_filter, b_plugin, b_filter)
 
     # 3. Authentication
     # Each plugin handles its own credential loading internally
-    src.authenticate()
-    dst.authenticate()
+    a.authenticate()
+    b.authenticate()
 
     # 4. Permission Guard (Plugin Specific)
-    # Check if the token has the right scopes for the resolved target
-    if hasattr(dst, "validate_permissions"):
-        dst.validate_permissions(target)
+    # Check if the token has the right scopes for the resolved b_filter
+    if hasattr(b, "validate_permissions"):
+        b.validate_permissions(b_filter)
+    if hasattr(a, "validate_permissions"):
+        a.validate_permissions(a_filter)
 
     # 5. The Sync Loop
-    typer.echo(f"🚀 Syncing {project} -> {target}...")
+    typer.echo(f"🚀 Syncing {a_filter} -> {b_filter}...")
 
-    raw_tasks = src.fetch_raw(project)
+    raw_tasks = a.fetch_raw(a_filter)
 
     for raw in raw_tasks:
-        src_task = src.to_cif(raw)
-        internal_uid = mgr.get_internal_uuid(input_plugin, src_task.ext_id)
+        a_task = a.to_cif(raw)
+        internal_uid = mgr.get_internal_uuid(a_plugin, a_task.ext_id)
 
         # 1. New Task? Just push it.
         if not internal_uid:
-            internal_uid = mgr.create_mapping(input_plugin, src_task.ext_id)
-            src_task.uuid = internal_uid
-            _push_new_task(src_task, dst, mgr, target)
+            internal_uid = mgr.create_mapping(a_plugin, a_task.ext_id)
+            a_task.uuid = internal_uid
+            _push_new_task(a_task, b, mgr, b_filter)
             continue
 
         # 2. Existing Task? Fetch the "Last Known State" from DB
-        src_task.uuid = internal_uid
+        a_task.uuid = internal_uid
         last_sync = mgr.get_sync_state(internal_uid)
 
         # Check if Source changed since last sync
-        src_changed = last_sync is None or src_task.get_content_hash() != last_sync["hash"]
+        src_changed = last_sync is None or a_task.get_content_hash() != last_sync["hash"]
 
         if src_changed:
             # 3. CONFLICT CHECK: Did the Destination change too?
-            dst_ext_id = mgr.get_external_id(output_plugin, internal_uid)
-            raw_dst = dst.fetch_one(dst_ext_id, target)  # You'll need this method in plugin
-            current_dst_task = dst.to_cif(raw_dst)
+            print(f"DEBUG: Looking for name '{b_plugin}' with UUID '{internal_uid}'")
+            dst_ext_id = mgr.get_external_id(b_plugin, internal_uid)
+            src_ext_id = mgr.get_external_id(a_plugin, internal_uid)
+            raw_dst = b.fetch_one(dst_ext_id, b_filter)  # You'll need this method in plugin
+            current_dst_task = b.to_cif(raw_dst)
 
             dst_changed = last_sync is None or current_dst_task.get_content_hash() != last_sync["hash"]
 
             if dst_changed:
                 base_task = TaskCIR.from_dict(last_sync["data"]) if last_sync else None
-                typer.secho(f"⚠️ CONFLICT: {src_task.description} changed on both sides!", fg="red")
+                typer.secho(f"⚠️ CONFLICT: {a_task.description} changed on both sides!", fg="red")
                 # 1. Perform the 3-way merge
-                merged_task = resolve_conflict_via_git(base_task, src_task, current_dst_task)
+                merged_task = resolve_conflict_via_git(base_task, a_task, current_dst_task)
 
                 # 2. Update Source (Taskwarrior) if needed
-                _tmp = src_task.copy()
+                _tmp = a_task.copy()
                 _tmp.update_from(merged_task)
-                if src_task.get_content_hash() != _tmp.get_content_hash():
-                    src.update_task(_tmp)
+                if a_task.get_content_hash() != _tmp.get_content_hash():
+                    a.update_task(src_ext_id, _tmp, a_filter)
 
                 # 3. Update Destination (GitHub) if needed
                 _tmp = current_dst_task.copy()
                 _tmp.update_from(merged_task)
                 if current_dst_task.get_content_hash() != _tmp.get_content_hash():
-                    dst.update_task(_tmp)
+                    b.update_task(dst_ext_id, _tmp, b_filter)
 
                 # 4. Finalize state
                 mgr.update_sync_state(_tmp)
             else:
                 # --- CASE B: CLEAN UPDATE (Only source changed) ---
-                typer.echo(f"  ↑ Updating destination: {src_task.description[:40]}...")
+                typer.echo(f"  ↑ Updating destination: {a_task.description[:40]}...")
 
-                # raw_out = dst.from_cif(src_task)
+                # raw_out = b.from_cif(a_task)
                 # raw_out["ext_id"] = dst_ext_id
 
-                success_id = dst.patch_task(dst_ext_id, merged_task)
+                success_id = b.update_task(dst_ext_id, current_dst_task.update_from(merged_task))
                 if success_id:
-                    mgr.update_sync_state(src_task)
+                    mgr.update_sync_state(a_task)
 
     typer.secho("✅ Sync complete.", fg="green", bold=True)
 
 
-def _push_new_task(task: TaskCIR, dst_plugin, mgr: MappingManager, target: str):
+def _push_new_task(task: TaskCIR, dst_plugin, mgr: MappingManager, b_filter: str):
     """Handles the first-time creation and state capture of a task."""
     # 1. Translate to destination format
     raw_out = dst_plugin.from_cif(task)
 
     # 2. Push to destination
-    new_ext_id = dst_plugin.send_raw(raw_out, target)
+    new_ext_id = dst_plugin.send_raw(raw_out, b_filter)
 
     if new_ext_id:
         # 3. Save the Identity Mapping (Internal UUID <-> GitHub ID)
-        mgr.create_mapping(dst_plugin.name, new_ext_id, task.uuid)
+        mgr.create_mapping(b_plugin, new_ext_id, task.uuid)
 
         # 4. Save the State Snapshot (The Hash)
         # This prevents the next sync from thinking it's a 'new change'
@@ -289,6 +295,17 @@ def config_set(key: str, value: str):
 
     save_to_config_file(key, value)
     typer.secho(f"✅ Saved: {key} = {value}", fg="green")
+
+
+@app.command()
+def init():
+    """Initialize the mapping database and tables."""
+    from .db import MappingManager
+
+    mgr = MappingManager()
+    # If your class has an explicit init method:
+    # mgr.initialize_tables()
+    typer.secho("✅ Database initialized successfully.", fg="green")
 
 
 if __name__ == "__main__":

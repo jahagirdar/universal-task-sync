@@ -34,7 +34,7 @@ class JsonPlugin:
         """Translate a TaskCIR object to a dictionary for JSON serialization."""
         return dataclasses.asdict(task)
 
-    def fetch_raw(self, filter_query: str) -> List[dict]:
+    def fetch_raw(self, target: str) -> List[dict]:
         """
         IO: Read from a JSON file.
         In this plugin, 'filter_query' is interpreted as the file path.

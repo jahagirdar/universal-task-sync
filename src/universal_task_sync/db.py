@@ -1,181 +1,171 @@
-import hashlib
 import json
 import os
 import sqlite3
 import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Optional  # Added Optional here
+from typing import Any, Dict, Optional
 
 from .models import TaskCIR
 
+SQL_DEBUG = True
+
+
+def sql_logger(query):
+    print(f"DEBUG SQL: {query}")
+
 
 def get_data_dir() -> Path:
-    """Resolve XDG_DATA_HOME, defaulting to ~/.local/share/universal_task_sync"""
+    """Resolve the persistent data directory for the SQLite database."""
     xdg_data = os.getenv("XDG_DATA_HOME")
-    if xdg_data:
-        base = Path(xdg_data)
-    else:
-        base = Path.home() / ".local" / "share"
-
+    base = Path(xdg_data) if xdg_data else Path.home() / ".local" / "share"
     data_dir = base / "universal_task_sync"
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
 
 
 def init_db():
+    """Initializes the database with lean tables for mapping and state."""
     db_path = get_data_dir() / "map.db"
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    with sqlite3.connect(db_path) as conn:
+        if SQL_DEBUG:
+            conn.set_trace_callback(sql_logger)
+            print(f"DEBUG: Opening connection to {db_path}")
+        # Table 1: ID Map - Links internal UUIDs to service-specific IDs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS id_map (
+                internal_uuid TEXT NOT NULL,
+                service_name  TEXT NOT NULL,
+                external_id   TEXT NOT NULL,
+                PRIMARY KEY (service_name, external_id)
+            )
+        """)
 
-    # Table 1: ID Map (The Bridge)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS id_map (
-            internal_uuid TEXT NOT NULL,
-            service_name  TEXT NOT NULL,
-            external_id   TEXT NOT NULL,
-            PRIMARY KEY (internal_uuid, service_name)
-        )
-    """)
+        # Table 2: Sync State - Stores the 'Last Known Good' state as a blob
+        # This is the 'Base' for 3-way merges.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sync_state (
+                internal_uuid  TEXT PRIMARY KEY,
+                content_hash   TEXT NOT NULL,
+                raw_json       TEXT NOT NULL,
+                last_modified  TEXT
+            )
+        """)
 
-    # Table 2: Sync State (Comprehensive Field List)
-    # This stores the "Last Known Good" state of a task
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sync_state (
-            internal_uuid  TEXT PRIMARY KEY,
-            type           TEXT DEFAULT 'task',
-            description    TEXT,
-            body           TEXT,
-            project        TEXT,
-            status         TEXT,
-            priority       TEXT,
-            tags           TEXT,           -- Stored as JSON string or comma-separated
-            start_date     DATETIME,
-            due_date       DATETIME,
-            scheduled_date DATETIME,
-            effort         TEXT,           -- timedelta as string (e.g. '2:00:00')
-            actual_effort  TEXT,
-            progress       INTEGER DEFAULT 0,
-            owner          TEXT,
-            delegate       TEXT,
-            depends        TEXT,           -- JSON list of internal_uuids
-            last_modified  DATETIME,
-            content_hash   TEXT            -- MD5/SHA of core fields to detect changes
-        )
-    """)
-    # Table 3: Project Memory (New!)
-    # Maps a source (e.g., tw:project_name) to a target (e.g., gh:owner/repo)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS project_map (
-            src_plugin    TEXT NOT NULL,
-            src_project   TEXT NOT NULL,
-            dst_plugin    TEXT NOT NULL,
-            target_id     TEXT NOT NULL,
-            PRIMARY KEY (src_plugin, src_project, dst_plugin)
-        )
-    """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ext ON id_map (external_id, service_name)")
-    conn.commit()
-    conn.close()
-    return db_path
+        # Table 3: Project Links - Remembers where -p maps to -t
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS project_map (
+                src_plugin  TEXT NOT NULL,
+                src_project TEXT NOT NULL,
+                dst_plugin  TEXT NOT NULL,
+                dst_target  TEXT NOT NULL,
+                PRIMARY KEY (src_plugin, src_project, dst_plugin)
+            )
+        """)
+        conn.commit()
 
 
 class MappingManager:
     def __init__(self):
-        self.db_path = init_db()
+        self.db_path = get_data_dir() / "map.db"
+        init_db()
 
-    def get_internal_uuid(self, service: str, ext_id: str) -> Optional[str]:
-        """Check if an external task is already known."""
-        with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute(
-                "SELECT internal_uuid FROM id_map WHERE service_name=? AND external_id=?", (service, ext_id)
-            ).fetchone()
-            return res[0] if res else None
-
-    def create_mapping(self, service: str, ext_id: str, internal_uuid: str = None) -> str:
-        """Link an external task to a new or existing internal UUID."""
-        uid = internal_uuid or str(uuid.uuid4())
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO id_map (internal_uuid, service_name, external_id) VALUES (?, ?, ?)",
-                (uid, service, ext_id),
-            )
-            return uid
-
-    def get_stored_target(self, src_plugin: str, src_project: str, dst_plugin: str) -> Optional[str]:
-        """Find if we previously synced this source project to a specific destination."""
-        with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute(
-                "SELECT target_id FROM project_map WHERE src_plugin=? AND src_project=? AND dst_plugin=?",
-                (src_plugin, src_project, dst_plugin),
-            ).fetchone()
-            return res[0] if res else None
-
-    def store_project_link(self, src_plugin: str, src_project: str, dst_plugin: str, target_id: str):
-        """Save the link for future one-word syncs."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO project_map VALUES (?, ?, ?, ?)",
-                (src_plugin, src_project, dst_plugin, target_id),
-            )
+    # --- Sync State & 3-Way Merge Logic ---
 
     def update_sync_state(self, task: TaskCIR):
-        """Saves the full object and its hash for future 3-way merges."""
-        content_data = {
-            "description": task.description,
-            "body": task.body,
-            "status": task.status.value,
-            "tags": sorted(task.tags) if task.tags else [],
-        }
-        content_hash = hashlib.md5(json.dumps(content_data, sort_keys=True).encode()).hexdigest()
-
-        # Serialize the whole task for the 'Base' file in merges
-        full_json = json.dumps(task.to_dict())
+        """Captures the full state of the task to act as the future Merge Base."""
+        content_hash = task.get_content_hash()
+        # We store the FULL JSON including system fields for total recovery
+        raw_json = task.to_json(only_mergeable=True)
 
         with sqlite3.connect(self.db_path) as conn:
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sync_state
                 (internal_uuid, content_hash, raw_json, last_modified)
                 VALUES (?, ?, ?, ?)
             """,
-                (task.uuid, content_hash, full_json, task.last_modified.isoformat()),
+                (task.uuid, content_hash, raw_json, datetime.now().isoformat()),
             )
-            conn.commit()
 
-    def get_sync_state(self, internal_uuid: str) -> Optional[dict]:
+    def get_sync_state(self, internal_uuid: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the hash and data for change detection."""
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute(
-                "SELECT content_hash as hash FROM sync_state WHERE internal_uuid=?", (internal_uuid,)
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            row = conn.execute(
+                "SELECT content_hash, raw_json FROM sync_state WHERE internal_uuid = ?", (internal_uuid,)
             ).fetchone()
-            return {"hash": res[0]} if res else None
-
-    def get_sync_base(self, internal_uuid: str) -> Optional[TaskCIR]:
-        with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT raw_json FROM sync_state WHERE internal_uuid=?", (internal_uuid,)).fetchone()
-            if res:
-                data = json.loads(res[0])
-                return TaskCIR.from_dict(data)
+            if row:
+                return {"hash": row[0], "data": json.loads(row[1])}
             return None
 
-    def get_external_id(self, service: str, internal_uuid: str) -> Optional[str]:
-        """
-        Retrieves the service-specific ID (e.g., GitHub issue number)
-        for a given internal UUID.
-        """
-        query = "SELECT external_id FROM id_map WHERE service_name = ? AND internal_uuid = ?"
+    def get_sync_base(self, internal_uuid: str) -> Optional[TaskCIR]:
+        """Reconstructs the TaskCIR object for use as Stage 1 in Git Mergetool."""
+        state = self.get_sync_state(internal_uuid)
+        return TaskCIR.from_dict(state["data"]) if state else None
 
+    # --- Identity & Mapping ---
+
+    def get_internal_uuid(self, service: str, external_id: str) -> Optional[str]:
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(query, (service, internal_uuid)).fetchone()
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            row = conn.execute(
+                "SELECT internal_uuid FROM id_map WHERE service_name = ? AND external_id = ?", (service, external_id)
+            ).fetchone()
             return row[0] if row else None
 
-    def get_all_mapped_uuids(self, service1: str, service2: str) -> set:
+    def create_mapping(self, service: str, external_id: str, existing_uuid: str = None) -> str:
+        """
+        Links an external ID to an internal UUID.
+        If existing_uuid is provided (from Reconciler), it 'bridges' the tasks.
+        """
+        new_uuid = existing_uuid or str(uuid.uuid4())[:16]
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute(
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            # INSERT OR REPLACE ensures that if we are re-mapping
+            # a task to a different internal group, it updates correctly.
+            conn.execute(
+                "INSERT OR REPLACE INTO id_map (internal_uuid, service_name, external_id) VALUES (?, ?, ?)",
+                (new_uuid, service, str(external_id)),
+            )
+        return new_uuid
+
+    def get_external_id(self, service: str, internal_uuid: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            row = conn.execute(
+                "SELECT external_id FROM id_map WHERE service_name = ? AND internal_uuid = ?", (service, internal_uuid)
+            ).fetchone()
+            return row[0] if row else None
+
+    # --- Project Connectivity ---
+
+    def store_project_link(self, src_p: str, src_proj: str, dst_p: str, dst_t: str):
+        with sqlite3.connect(self.db_path) as conn:
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            conn.execute(
                 """
-                SELECT DISTINCT internal_uuid FROM id_map
-                WHERE service_name IN (?, ?)
+                INSERT OR REPLACE INTO project_map VALUES (?, ?, ?, ?)
             """,
-                (service1, service2),
-            ).fetchall()
-            return {r[0] for r in res}
+                (src_p, src_proj, dst_p, dst_t),
+            )
+
+    def get_stored_target(self, src_p: str, src_proj: str, dst_p: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            if SQL_DEBUG:
+                conn.set_trace_callback(sql_logger)
+            row = conn.execute(
+                """
+                SELECT dst_target FROM project_map
+                WHERE src_plugin=? AND src_project=? AND dst_plugin=?
+            """,
+                (src_p, src_proj, dst_p),
+            ).fetchone()
+            return row[0] if row else None

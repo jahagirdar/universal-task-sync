@@ -118,6 +118,10 @@ class GitHubPlugin:
     def to_cif(self, raw: dict) -> TaskCIR:
         # Support both REST Issue and GraphQL Project Node structures
         item = raw.get("content", raw)
+        external_id = str(raw.get("number"))
+        if not external_id or external_id == "None":
+            # Fallback to global node_id or id if number is missing
+            external_id = str(raw.get("id"))
 
         status = TaskStatus.PENDING
         if item.get("state") == "closed":
@@ -134,15 +138,18 @@ class GitHubPlugin:
         else:  # REST style (list)
             tags = [l["name"] for l in raw_labels if isinstance(l, dict)]
 
-        return TaskCIR(
+        cif = TaskCIR(
             uuid=None,
-            ext_id=str(item.get("databaseId") or item.get("id")),
+            ext_id=external_id,  # THIS MUST NOT BE NONE
+            # ext_id=str(item.get("databaseId") or item.get("id")),
             description=item.get("title", "No Title"),
             body=item.get("body") or "",
             last_modified=dt,
             status=status,
             tags=tags,
         )
+        print(f"{raw=} {cif=}")
+        return cif
 
     def from_cif(self, task: TaskCIR) -> dict:
         return {
@@ -157,6 +164,26 @@ class GitHubPlugin:
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
         return response.json()
+
+    def update_task(self, ext_id: str, task: TaskCIR, target: str) -> str:
+        """
+        Updates an existing GitHub entity.
+        Routes to REST for Issues or GraphQL for Project V2 fields.
+        """
+        # 1. Prepare standard data
+        update_data = self.from_cif(task)
+
+        # 2. Routing logic
+        if target.startswith("project:"):
+            # Update Project V2 Item (including custom fields like Effort)
+            return self._update_project_v2_item(ext_id, task, target)
+
+        # 3. Standard Repo Issue Update (REST)
+        url = f"{self.base_url}/repos/{target}/issues/{ext_id}"
+        response = requests.patch(url, json=update_data, headers=self.headers)
+        response.raise_for_status()
+
+        return str(response.json().get("number"))
 
     def send_raw(self, raw_data: dict, target: str) -> Optional[str]:
         # 1. Identity Management

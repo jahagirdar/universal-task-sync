@@ -1,35 +1,36 @@
 from abc import ABC, abstractmethod
+from typing import Any, List
+
+from .models import TaskCIR
+
 
 class BasePlugin(ABC):
     @abstractmethod
-    def fetch_items(self, since: Optional[datetime] = None) -> List[TaskCIR]:
-        """Fetch all tasks/comments from the API modified since 'since'."""
+    def authenticate(self):
+        """Handle credential collection/loading. Raise error if it fails."""
         pass
 
     @abstractmethod
-    def push_item(self, item: TaskCIR) -> str:
-        """
-        Send a TaskCIR object to the external API.
-        Returns the new 'ext_id' if created.
-        """
+    def fetch_raw(self, target: str) -> List[Any]:
+        """Fetch all raw data from the API."""
         pass
 
     @abstractmethod
-    def update_item(self, item: TaskCIR) -> bool:
-        """Update an existing item on the external API."""
-        pass
-
-    @abstractmethod
-    def map_to_internal(self, raw_data: Any) -> TaskCIR:
+    def to_cif(self, raw_data: Any) -> TaskCIR:
         """Convert API-specific JSON to our TaskCIR dataclass."""
         pass
 
     @abstractmethod
-    def map_from_internal(self, item: TaskCIR) -> Any:
+    def from_cif(self, item: TaskCIR) -> Any:
         """Convert TaskCIR dataclass to API-specific JSON."""
         pass
-    class BasePlugin(ABC):
+
     @abstractmethod
-    def authenticate(self):
-        """Handle credential collection/loading. Raise error if it fails."""
+    def send_raw(self, raw_item: Any, target: str) -> str:
+        """Send raw data to the external API and return the new 'ext_id'."""
+        pass
+
+    @abstractmethod
+    def patch_raw(self, ext_id: str, raw_item: Any, target: str) -> bool:
+        """Update an existing item on the external API using raw data."""
         pass
