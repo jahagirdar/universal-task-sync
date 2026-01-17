@@ -25,7 +25,7 @@ class Priority(Enum):
 class TaskCIR:
     # --- Identification & Type ---
     uuid: str = field(default="", metadata={"merge": False})
-    ext_id: str = field(default="", metadata={"merge": False})
+    tool_uid: str = field(default="", metadata={"merge": False})
     last_modified: datetime = field(default_factory=datetime.now, metadata={"merge": False})
     description: str = field(default="", metadata={"merge": True})
     # Allows the engine to distinguish between a 'task', 'comment', or 'milestone'
@@ -69,13 +69,13 @@ class TaskCIR:
         """
         return replace(self)
 
-    def update_from(self, merged_data: dict):
+    def update_from(self, merged_data: dict) -> None:
         """
         Updates the current object's content fields using a dictionary
         (the result of the 3-way merge).
 
         This method is 'identity-safe': it only updates fields that were
-        part of the merge, leaving uuid, ext_id, and last_modified alone.
+        part of the merge, leaving uuid, tool_id, and last_modified alone.
         """
         for f in fields(self):
             # Only update if the field is mergeable AND exists in the truth dict
@@ -127,6 +127,11 @@ class TaskCIR:
             # 3. Handle Enums
             elif isinstance(field_type, type) and issubclass(field_type, Enum):
                 processed_data[name] = field_type(value)
+
+            elif field_type == List[str]:
+                processed_data[name] = list(value)
+            elif hasattr(field_type, "__origin__") and field_type.__origin__ is list:
+                processed_data[name] = value
 
             # 4. Handle Optionals of Enums (Generic parsing)
             elif hasattr(field_type, "__origin__") and field_type.__origin__ is Union:

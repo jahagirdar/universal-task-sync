@@ -4,13 +4,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 
-from universal_task_sync.models import CIRTaskEncoder, TaskCIR
+from universal_task_sync.models import TaskCIR
+from universal_task_sync.serialization import TaskJSONEncoder
 
 
 class JsonPlugin:
     """Strictly handles JSON File <-> CIF translation and IO."""
 
+    def name(self) -> str:
+        return "json"
+
+    def set_filter(self, filter: str):
+        self.project = filter
+
     def authenticate(self):
+        return True
         pass
 
     def to_cif(self, raw_data: dict) -> TaskCIR:
@@ -37,9 +45,9 @@ class JsonPlugin:
     def fetch_raw(self, target: str) -> List[dict]:
         """
         IO: Read from a JSON file.
-        In this plugin, 'filter_query' is interpreted as the file path.
+        In this plugin, 'self.project' is interpreted as the file path.
         """
-        path = Path(filter_query)
+        path = Path(self.project)
         if not path.exists():
             return []
 
@@ -47,10 +55,16 @@ class JsonPlugin:
             data = json.load(f)
             return data if isinstance(data, list) else [data]
 
+    def delete_task(self, tool_uid: str, target: str = None) -> bool:
+        pass
+
+    def update_task(self, tool_uid: str, task: TaskCIR, target: str) -> str:
+        return "abcd"
+
     def send_raw(self, raw_data: Any):
         """
         IO: Write to stdout or a file.
         By default, we output to stdout to allow piping (e.g., uts -o json > tasks.json).
         """
         # We wrap in a list because uts processes tasks one by one in the loop
-        print(json.dumps(raw_data, cls=CIRTaskEncoder, indent=4))
+        print(json.dumps(raw_data, cls=TaskJSONEncoder, indent=4))

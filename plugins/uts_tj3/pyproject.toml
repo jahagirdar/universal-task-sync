@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"] # Added tree-sitter for build-time compilation
+build-backend = "hatchling.build"
+
+[project]
+name = "uts-tj3"
+version = "0.1.0"
+dependencies = [
+    "universal-task-sync",
+    "requests",
+    "tree-sitter-taskjuggler" # Runtime dependency for the plugin
+]
+
+[project.entry-points."universal_task_sync.plugins"]
+tj3 = "uts_tj3.plugin:TaskJugglerPlugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uts_tj3"]

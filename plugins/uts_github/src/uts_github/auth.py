@@ -25,10 +25,16 @@ def get_github_creds(force_prompt: bool = False) -> str:
             json.dump({"pat": pat}, f)
 
     with open(config_path) as f:
-        return json.load(f).get("pat")
+        data = json.load(f)
+
+    pat = data.get("pat")
+    if not pat:
+        raise RuntimeError("GitHub PAT missing from config file")
+
+    return pat
 
 
-def delete_github_creds():
+def delete_github_creds() -> None:
     config_path = get_config_path()
     if config_path.exists():
         os.remove(config_path)

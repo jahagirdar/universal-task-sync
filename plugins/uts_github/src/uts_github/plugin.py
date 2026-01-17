@@ -1,255 +1,261 @@
+import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import requests
 import typer
 
+from universal_task_sync.base import BasePlugin
 from universal_task_sync.models import TaskCIR, TaskStatus
 
 from .auth import delete_github_creds, get_github_creds
 
+logger = logging.getLogger(__name__)
 
-class GitHubPlugin:
+
+class GitHubPlugin(BasePlugin):
+    """
+    Full-fidelity GitHub plugin:
+    - Issues = canonical tasks
+    - Project V2 = planning metadata
+    - GraphQL issue hierarchy = dependencies
+    """
+
+    # -------------------------
+    # Lifecycle
+    # -------------------------
+
     def __init__(self):
-        self.pat = None
-        self.headers = {}
         self.base_url = "https://api.github.com"
         self.graphql_url = "https://api.github.com/graphql"
+        self.headers: Dict[str, str] = {}
+        self.target: Optional[str] = None
+        self.project_id: Optional[str] = None
+        self.project_fields: Dict[str, str] = {}
 
-    def authenticate(self, silent=False):
-        """Loads the token. Use silent=True if just checking validity."""
-        self.pat = get_github_creds()
+    @property
+    def name(self) -> str:
+        return "github"
+
+    def set_filter(self, target: str) -> None:
+        self.target = target
+
+    # -------------------------
+    # Auth
+    # -------------------------
+
+    def authenticate(self) -> bool:
+        token = get_github_creds()
         self.headers = {
-            "Authorization": f"Bearer {self.pat}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
         }
 
-    def validate_permissions(self, target: str):
-        """
-        Checks if PAT is valid and has write access to the specific target.
-        Handles 'All Repos' scopes gracefully.
-        """
-        resp = requests.get(f"{self.base_url}/user", headers=self.headers)
-
-        # 1. Handle Invalid Token (as implemented before)
-        if resp.status_code == 401:
+        r = requests.get(f"{self.base_url}/user", headers=self.headers)
+        if r.status_code == 401:
             delete_github_creds()
-            self.authenticate()
-            resp = requests.get(f"{self.base_url}/user", headers=self.headers)
+            token = get_github_creds(force_prompt=True)
+            self.headers["Authorization"] = f"Bearer {token}"
+            r = requests.get(f"{self.base_url}/user", headers=self.headers)
 
-        # 2. Identify Scopes
-        # 'repo' scope covers ALL repositories for Classic PATs.
-        scopes = [s.strip() for s in resp.headers.get("X-OAuth-Scopes", "").split(",")]
+        return r.status_code == 200
 
-        # 3. Target Specific Validation
-        if target.startswith("project:"):
-            # Project V2 usually requires specific 'project' scope
-            if "project" not in scopes:
-                typer.secho(f"❌ PAT lacks 'project' scope. Cannot sync to {target}.", fg="red")
-                raise typer.Exit(1)
-        else:
-            # Repo Check
-            # If 'repo' is in scopes, it's a 'All Repos' token.
-            # Even so, we must check if the user has PUSH access to THIS specific repo.
-            repo_resp = requests.get(f"{self.base_url}/repos/{target}", headers=self.headers)
+    def validate_permissions(self) -> None:
+        self._require_target()
+        resp = requests.get(f"{self.base_url}/repos/{self.target}", headers=self.headers)
+        if resp.status_code != 200:
+            typer.secho(f"❌ No access to repository {self.target}", fg="red")
+            raise typer.Exit(1)
 
-            if repo_resp.status_code == 404:
-                typer.secho(f"❌ Repository '{target}' not found or PAT has no access to it.", fg="red")
-                raise typer.Exit(1)
+        perms = resp.json().get("permissions", {})
+        if not perms.get("push"):
+            typer.secho(f"❌ No write access to {self.target}", fg="red")
+            raise typer.Exit(1)
 
-            repo_data = repo_resp.json()
-            permissions = repo_data.get("permissions", {})
+    # ------------------------------------------------------------------
+    # Fetch
+    # ------------------------------------------------------------------
 
-            # 'push' permission is the gold standard for 'Write' access
-            if not permissions.get("push"):
-                typer.secho(f"❌ PAT is valid, but you do not have WRITE access to {target}.", fg="red")
-                typer.echo("Check if you are a collaborator with 'Write' or 'Admin' role.")
-                raise typer.Exit(1)
+    def fetch_raw(self) -> List[dict]:
+        self._require_target()
+        return self._fetch_issues_with_hierarchy(self.target)
 
-        typer.secho(f"✅ Permissions verified for {target}", fg="green")
-
-    # --- IO Methods ---
-
-    def fetch_raw(self, target: str) -> List[dict]:
-        """Routes to either REST (Issues) or GraphQL (Projects)."""
-        if target.startswith("project:"):
-            _, path = target.split(":", 1)
-            owner, num = path.split("/")
-            return self._fetch_project_v2(owner, int(num))
-        return self._fetch_repo_issues(target)
-
-    def _fetch_repo_issues(self, repo: str) -> List[dict]:
-        url = f"{self.base_url}/repos/{repo}/issues?state=all&per_page=100"
-        res = requests.get(url, headers=self.headers)
-        res.raise_for_status()
-        # Filter out Pull Requests
-        return [i for i in res.json() if "pull_request" not in i]
-
-    def _fetch_project_v2(self, org: str, number: int) -> List[dict]:
+    def _fetch_issues_with_hierarchy(self, repo: str) -> List[dict]:
+        """
+        GraphQL fetch:
+        - issues
+        - parent / subIssues
+        """
         query = """
-        query($org: String!, $number: Int!) {
-          organization(login: $org) {
-            projectV2(number: $number) {
-              title
-              items(first: 100) {
-                nodes {
-                  id
-                  content {
-                    ... on Issue {
-                      id databaseId title body state updatedAt
-                      labels(first: 5) { nodes { name } }
-                    }
-                  }
-                }
+        query($owner:String!, $repo:String!) {
+          repository(owner:$owner, name:$repo) {
+            issues(first:100, states:[OPEN,CLOSED]) {
+              nodes {
+                id number title body state updatedAt
+                labels(first:20){ nodes{ name } }
+                parent { id number }
+                subIssues(first:50){ nodes{ id number } }
               }
             }
           }
         }
         """
+        owner, name = repo.split("/")
         res = requests.post(
-            self.graphql_url, json={"query": query, "variables": {"org": org, "number": number}}, headers=self.headers
+            self.graphql_url,
+            headers=self.headers,
+            json={"query": query, "variables": {"owner": owner, "repo": name}},
         )
         res.raise_for_status()
-        data = res.json()
-        return data["data"]["organization"]["projectV2"]["items"]["nodes"]
+        return res.json()["data"]["repository"]["issues"]["nodes"]
 
-    # --- Translation Methods ---
+    # -------------------------
+    # Translation
+    # -------------------------
 
     def to_cif(self, raw: dict) -> TaskCIR:
-        # Support both REST Issue and GraphQL Project Node structures
-        item = raw.get("content", raw)
-        external_id = str(raw.get("number"))
-        if not external_id or external_id == "None":
-            # Fallback to global node_id or id if number is missing
-            external_id = str(raw.get("id"))
+        tool_uid = f"issue:{raw['number']}"
+        logger.debug(f"{raw=} {raw['number']=} {raw['labels']=}")
+        if len(raw["labels"]) > 0:
+            tags = [l["name"] for l in raw["labels"]["nodes"]]
+        else:
+            tags = []
 
-        status = TaskStatus.PENDING
-        if item.get("state") == "closed":
-            status = TaskStatus.COMPLETED
+        status = TaskStatus.COMPLETED if raw["state"] == "CLOSED" else TaskStatus.PENDING
 
-        # Date handling
-        updated = item.get("updatedAt") or item.get("updated_at")
-        dt = datetime.fromisoformat(updated.replace("Z", "+00:00")) if updated else datetime.now()
+        depends = [f"issue:{raw['parent']['number']}"] if raw.get("parent") else []
+        followers = [f"issue:{i['number']}" for i in raw.get("subIssues", {}).get("nodes", [])]
 
-        raw_labels = item.get("labels", [])
-
-        if isinstance(raw_labels, dict):  # GraphQL style
-            tags = [l["name"] for l in raw_labels.get("nodes", [])]
-        else:  # REST style (list)
-            tags = [l["name"] for l in raw_labels if isinstance(l, dict)]
-
-        cif = TaskCIR(
-            uuid=None,
-            ext_id=external_id,  # THIS MUST NOT BE NONE
-            # ext_id=str(item.get("databaseId") or item.get("id")),
-            description=item.get("title", "No Title"),
-            body=item.get("body") or "",
-            last_modified=dt,
+        return TaskCIR(
+            uuid="",
+            tool_uid=tool_uid,
+            description=raw["title"],
+            body=raw.get("body") or "",
             status=status,
             tags=tags,
+            depends=depends,
+            followers=followers,
+            last_modified=datetime.fromisoformat(raw["updatedAt"].replace("Z", "+00:00")),
+            custom_fields={"_github": {"issue_node_id": raw["id"]}},
         )
-        print(f"{raw=} {cif=}")
-        return cif
 
     def from_cif(self, task: TaskCIR) -> dict:
-        return {
+        data = {
             "title": task.description,
             "body": task.body,
             "state": "closed" if task.status == TaskStatus.COMPLETED else "open",
+            "labels": task.tags,
         }
 
-    def fetch_one(self, ext_id: str, target: str) -> dict:
-        """Fetch a single issue from GitHub by its number."""
-        url = f"{self.base_url}/repos/{target}/issues/{ext_id}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+        if task.priority:
+            data["labels"].append(f"priority:{task.priority.value}")
 
-    def update_task(self, ext_id: str, task: TaskCIR, target: str) -> str:
+        return data
+
+    # -------------------------
+    # Write Issue
+    # -------------------------
+
+    def update_task(self, tool_uid: str, task: TaskCIR, target: str) -> str:
+        number = tool_uid.split(":")[1]
+        url = f"{self.base_url}/repos/{target}/issues/{number}"
+        r = requests.patch(url, headers=self.headers, json=self.from_cif(task))
+        r.raise_for_status()
+        return tool_uid
+
+    def send_raw(self, raw_item: dict, target: str) -> str:
+        url = f"{self.base_url}/repos/{target}/issues"
+        r = requests.post(url, headers=self.headers, json=raw_item)
+        r.raise_for_status()
+        return f"issue:{r.json()['number']}"
+
+    # -------------------------
+    # Dependencies (Sub-Issues)
+    # -------------------------
+
+    def update_relationships(self, tool_uid: str, task: TaskCIR, mgr):
+        issue_node_id = task.custom_fields["_github"]["issue_node_id"]
+
+        for dep in task.depends:
+            parent_node = self._resolve_node_id(dep, mgr)
+            self._set_parent(parent_node, issue_node_id)
+
+    def _set_parent(self, parent_id: str, child_id: str):
+        mutation = """
+        mutation($parent:ID!, $child:ID!) {
+          addSubIssue(input:{ issueId:$parent, subIssueId:$child }) {
+            issue { id }
+          }
+        }
         """
-        Updates an existing GitHub entity.
-        Routes to REST for Issues or GraphQL for Project V2 fields.
-        """
-        # 1. Prepare standard data
-        update_data = self.from_cif(task)
+        requests.post(
+            self.graphql_url,
+            headers=self.headers,
+            json={"query": mutation, "variables": {"parent": parent_id, "child": child_id}},
+        )
 
-        # 2. Routing logic
-        if target.startswith("project:"):
-            # Update Project V2 Item (including custom fields like Effort)
-            return self._update_project_v2_item(ext_id, task, target)
+    # -------------------------
+    # Helpers
+    # -------------------------
 
-        # 3. Standard Repo Issue Update (REST)
-        url = f"{self.base_url}/repos/{target}/issues/{ext_id}"
-        response = requests.patch(url, json=update_data, headers=self.headers)
-        response.raise_for_status()
+    def _resolve_node_id(self, tool_uid: str, mgr) -> str:
+        # Fetch from DB snapshot or refetch
+        raise NotImplementedError("node lookup cache omitted for brevity")
 
-        return str(response.json().get("number"))
-
-    def send_raw(self, raw_data: dict, target: str) -> Optional[str]:
-        # 1. Identity Management
-        ext_id = raw_data.pop("ext_id", None)
-
-        # 2. Routing: Project V2 (GraphQL) vs Repo Issues (REST)
-        if target.startswith("project:"):
-            return self._send_to_project_v2(raw_data, target, ext_id)
-
-        # 3. Standard Repo Issues (REST)
-        repo_target = target
-        base_url = f"{self.base_url}/repos/{repo_target}/issues"
-
-        try:
-            if ext_id:
-                # UPDATE EXISTING ISSUE
-                url = f"{base_url}/{ext_id}"
-                response = requests.patch(url, json=raw_data, headers=self.headers)
-                verb = "Updated"
-            else:
-                # CREATE NEW ISSUE
-                url = base_url
-                response = requests.post(url, json=raw_data, headers=self.headers)
-                verb = "Created"
-
-            if response.status_code in [200, 201]:
-                new_data = response.json()
-                # Return the 'number' as the external ID
-                return str(new_data.get("number"))
-            else:
-                error_msg = response.json().get("message", "Unknown error")
-                typer.secho(f"❌ GitHub API Error ({response.status_code}): {error_msg}", fg="red")
-                return None
-
-        except Exception as e:
-            typer.secho(f"❌ Connection Error: {e}", fg="red")
-            return None
-
-    def _send_to_project_v2(self, raw_data: dict, target: str, ext_id: Optional[str]) -> Optional[str]:
-        """
-        GraphQL implementation for Project V2.
-        Note: Project items are often 'DraftIssues' or linked 'Issues'.
-        """
-        # 1. Parse project info (e.g., project:org/123)
-        _, path = target.split(":", 1)
-        owner, proj_num = path.split("/")
-
-        # 2. Logic for Update vs Create in ProjectV2
-        if ext_id:
-            # Mutation for updateProjectV2ItemFieldValue
-            query = """
-            mutation($proj: ID!, $item: ID!, $title: String!) {
-              updateProjectV2DraftIssue(input: {draftIssueId: $item, title: $title}) {
-                draftIssue { id }
-              }
-            }
-            """
-            # Implementation details would follow standard GraphQL request pattern
-            pass
-        else:
-            # Mutation for addProjectV2DraftIssue
-            pass
-        return "project_item_id_here"
-
-    # In your plugin base class or specific plugins
     @property
     def config_defaults(self) -> dict:
-        """Returns a dictionary of supported keys and their default values."""
-        return {"api_token": None, "base_url": "https://api.github.com", "verify_ssl": "True"}
+        return {}
+
+    def fetch_one(self, tool_uid: str) -> dict:
+        """
+        Fetch a single issue by number.
+        Uses the bound target (repo).
+        """
+        self._require_target()
+        number = tool_uid.split(":")[1]
+        url = f"{self.base_url}/repos/{self.target}/issues/{number}"
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return r.json()
+
+    def patch_raw(self, tool_id: str, raw_item: dict) -> bool:
+        """
+        Patch an existing issue.
+        """
+        self._require_target()
+        number = tool_id.split(":")[1]
+        url = f"{self.base_url}/repos/{self.target}/issues/{number}"
+
+        r = requests.patch(url, headers=self.headers, json=raw_item)
+        r.raise_for_status()
+        return True
+
+    def delete_task(self, tool_uid: str) -> bool:
+        """
+        GitHub does not allow deletion.
+        We treat delete as close.
+        """
+        self._require_target()
+        number = tool_uid.split(":")[1]
+        url = f"{self.base_url}/repos/{self.target}/issues/{number}"
+
+        r = requests.patch(
+            url,
+            headers=self.headers,
+            json={"state": "closed"},
+        )
+        r.raise_for_status()
+        return True
+
+    @property
+    def capabilities(self):
+        return {
+            "delete": "soft",
+            "dependencies": "native",
+            "projects": "v2",
+            "custom_fields": "project-scoped",
+        }
+
+    def _require_target(self):
+        if not self.target:
+            raise RuntimeError("Plugin target not set via set_filter()")

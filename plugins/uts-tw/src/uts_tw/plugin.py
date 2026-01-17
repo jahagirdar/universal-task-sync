@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import List
 
 import typer
+from taskw import TaskWarrior
 
 from universal_task_sync.models import Priority, TaskCIR, TaskStatus
 
@@ -11,8 +12,27 @@ from universal_task_sync.models import Priority, TaskCIR, TaskStatus
 class TaskwarriorPlugin:
     """Strictly handles TW <-> CIF translation and IO."""
 
-    def authenticate(self):
-        pass
+    def set_filter(self, filter):
+        self.target = filter
+        parts = filter.split()
+        result = {"tags": []}
+
+        for item in parts:
+            if item.startswith("+"):
+                # Remove the '+' and add to tags list
+                result["tags"].append(item[1:])
+            elif ":" in item:
+                # Split by the first colon found
+                key, value = item.split(":", 1)
+                result[key] = value
+                self.filter = result
+
+    @property
+    def name(self) -> str:
+        return "tw"
+
+    def authenticate(self) -> bool:
+        return True
 
     def to_cif(self, raw: dict) -> TaskCIR:
         """Translate TW JSON dict to CIF."""
@@ -46,7 +66,7 @@ class TaskwarriorPlugin:
 
         return TaskCIR(
             uuid=raw.get("uuid"),
-            ext_id=raw.get("uuid"),
+            tool_uid=raw.get("uuid"),
             last_modified=p_date(raw.get("modified")) or datetime.now(),
             description=raw.get("description", ""),
             body="\n".join([a["description"] for a in raw.get("annotations", [])]),
@@ -89,31 +109,66 @@ class TaskwarriorPlugin:
         # Convert effort timedelta back to string (e.g., '2.0h')
         if task.effort:
             tw_dict["effort"] = f"{task.effort.total_seconds() / 3600}h"
+        if self.filter["project"]:
+            tw_dict["project"] = self.filter["project"]
+        tw_dict["tags"].extend(self.filter["tags"])
+        if len(tw_dict) > 0:
+            tw_dict["tags"] = list(set(tw_dict["tags"]))
 
-        return {k: v for k, v in tw_dict.items() if v is not None}
+        return {k: v for k, v in tw_dict.items() if v is not None and (not isinstance(v, list) or len(v) > 0)}
 
-    def fetch_raw(self, target: str) -> List[dict]:
+    def fetch_one(self, tool_uid: str) -> dict:
+        w = TaskWarrior()
+        _, tw_task = w.get_task(uuid=tool_uid)
+        return tw_task
+
+    def fetch_raw(self) -> List[dict]:
         """IO: Export from Taskwarrior."""
         cmd = ["task", "rc.json.array=on"]
-        if target:
-            cmd.append(target)
+        if self.target:
+            cmd.append(self.target)
         cmd.append("export")
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
 
-    def update_task(self, ext_id: str, task: TaskCIR, target: str) -> str:
-        from taskw import TaskWarrior
+    def add_task(self, task: TaskCIR, target: str) -> str:
+        w = TaskWarrior()
+        t = self.from_cif(task)
+        tsk = w.task_add(**t)
+        return tsk["uuid"]
+
+    def delete_task(self, tool_uid: str) -> bool:
+        """
+        In Taskwarrior, we 'complete' tasks rather than hard-deleting them
+        to keep the history in the 'Completed' list.
+        """
+        w = TaskWarrior()
+        try:
+            # Mark the task as done
+            w.task_done(uuid=tool_uid)
+            typer.echo(f"  ✅ Taskwarrior task {tool_uid[:8]} marked as DONE.")
+            return True
+        except Exception as e:
+            # If already done or deleted, we treat as success
+            if "not found" in str(e).lower():
+                return True
+            typer.secho(f"  ❌ Failed to complete Taskwarrior task: {e}", fg="red")
+            return False
+
+    def update_task(self, tool_uid: str, task: TaskCIR, target: str) -> str:
 
         w = TaskWarrior()
+        if tool_uid is None:
+            return self.add_task(task, target)
 
         # Fetch existing task
         try:
-            _, tw_task = w.get_task(uuid=ext_id)
+            _, tw_task = w.get_task(uuid=tool_uid)
             print(f"{tast=} {tw_task=}")
         except Exception:
-            typer.secho(f"❌ Taskwarrior task {ext_id} not found.", fg="red")
-            return ext_id
+            typer.secho(f"❌ Taskwarrior task {tool_uid} not found.", fg="red")
+            return tool_uid
 
         # 1. Update Allowed Fields
         tw_task["description"] = task.description
@@ -128,7 +183,7 @@ class TaskwarriorPlugin:
             # Check if this note already exists to avoid duplicates
             existing_notes = [a["description"] for a in tw_task.get("annotations", [])]
             if task.body not in existing_notes:
-                w.task_annotate(ext_id, task.body)
+                w.task_annotate(tool_uid, task.body)
 
         # 2. CRITICAL: Remove Read-Only Internal Fields
         # This prevents the "mask", "modified", and "entry" errors
@@ -148,13 +203,13 @@ class TaskwarriorPlugin:
         from universal_task_sync.models import TaskStatus
 
         if task.status == TaskStatus.COMPLETED:
-            w.task_done(uuid=ext_id)
+            w.task_done(uuid=tool_uid)
         else:
             # Push updates for pending tasks
             print(f"at end {tast=} {tw_task=}")
             w.task_update(tw_task)
 
-        return ext_id
+        return tool_uid
 
     def send_raw(self, raw_data: dict):
         """IO: Import into Taskwarrior."""

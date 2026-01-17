@@ -65,7 +65,7 @@ def get_full_manifest() -> dict:
             plugin_instance = plugin_class()
 
             # Namespace keys by plugin name (e.g., github.api_token)
-            prefix = plugin_instance.name
+            prefix = plugin_instance.name()
             for key, val in plugin_instance.config_defaults.items():
                 manifest[f"{prefix}.{key}"] = val
         except Exception as e:

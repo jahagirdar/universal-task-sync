@@ -5,7 +5,6 @@ from typing import Optional
 
 import typer
 
-from .config import get_config
 from .db import MappingManager
 from .loader import get_plugin  # Assuming your entry-point loader logic is here
 from .models import TaskCIR
@@ -15,136 +14,167 @@ app = typer.Typer(help="Universal Task Sync: Bridge your task managers.")
 app.add_typer(reconcile_app, name="reconcile")
 
 
+import logging
+
+logging.basicConfig(
+    filename="/tmp/uts.log",
+    level=logging.DEBUG,
+    format="%(module)s %(funcName)s %(lineno)d %(levelname)s:: %(message)s",
+)
+
+
 @app.command()
 def sync(
     a_plugin: str = typer.Option(..., "--a_plugin", "-a"),
     b_plugin: str = typer.Option(..., "--b_plugin", "-b"),
     a_filter: str = typer.Option(..., "--a_filter", help="a filter"),
-    b_filter: Optional[str] = typer.Option(None, "--b_filter", "-t", help="b filter"),
-):
-    """Sync tasks from a source to a destination with persistent mapping memory."""
+    b_filter: Optional[str] = typer.Option(None, "--b_filter", help="b filter"),
+) -> None:
+    """Sync tasks with persistent mapping, recursive discovery, and hybrid link logic."""
     mgr = MappingManager()
-
-    # 1. Initialize Plugins
     a = get_plugin(a_plugin)
     b = get_plugin(b_plugin)
 
-    # 2. Resolve Target from History
-    # If user didn't provide -t, look in the project_map table
+    # --- RETAINED: Target Resolution Logic ---
     if not b_filter:
-        b_filter = mgr.get_stored_target(a_plugin, a_filter, b_plugin)
-        if not b_filter:
-            typer.secho(f"❓ No b_filter history found for {a_plugin}:{a_filter}", fg="yellow")
-            b_filter = typer.prompt(f"Enter the {b_plugin} b_filter (e.g., owner/repo or a_filter:org/num)")
-            mgr.store_project_link(a_plugin, a_filter, b_plugin, b_filter)
-    else:
-        # Save or update the mapping if provided explicitly
+        b_filter = mgr.get_stored_target(a_plugin, a_filter, b_plugin) or typer.prompt(f"Enter {b_plugin} target")
         mgr.store_project_link(a_plugin, a_filter, b_plugin, b_filter)
-
+    a.set_filter(a_filter)
+    b.set_filter(b_filter)
     # 3. Authentication
     # Each plugin handles its own credential loading internally
-    a.authenticate()
-    b.authenticate()
+    for plugin in [a, b]:
+        if not plugin.authenticate():
+            typer.secho(f"❌ Auth failed for {plugin.name}", fg="red")
+            raise typer.Exit(1)
 
     # 4. Permission Guard (Plugin Specific)
     # Check if the token has the right scopes for the resolved b_filter
     if hasattr(b, "validate_permissions"):
-        b.validate_permissions(b_filter)
+        b.validate_permissions()
     if hasattr(a, "validate_permissions"):
-        a.validate_permissions(a_filter)
+        a.validate_permissions()
+    if not typer.confirm(f"Sync {a_plugin} ({a_filter}) <-> {b_plugin} ({b_filter})?", default=True):
+        raise typer.Abort()
 
-    # 5. The Sync Loop
-    typer.echo(f"🚀 Syncing {a_filter} -> {b_filter}...")
+    # 1. FETCH & DISCOVER (Recursive Discovery Phase)
+    # Builds the graph and ensures everything has an Internal UUID
+    tasks_a = {a.to_cif(r).tool_uid: a.to_cif(r) for r in a.fetch_raw()}
+    tasks_b = {b.to_cif(r).tool_uid: b.to_cif(r) for r in b.fetch_raw()}
+    logging.debug(f"{tasks_a=}\n{tasks_b=}")
 
-    raw_tasks = a.fetch_raw(a_filter)
+    for t in list(tasks_a.values()):
+        t.uuid = mgr.ensure_mapping(a_plugin, t.tool_uid)
+        t.depends = translate_and_discover(a, tasks_a, t.depends, mgr)
+        t.followers = translate_and_discover(a, tasks_a, t.followers, mgr)
 
-    for raw in raw_tasks:
-        a_task = a.to_cif(raw)
-        internal_uid = mgr.get_internal_uuid(a_plugin, a_task.ext_id)
+    for t in list(tasks_b.values()):
+        t.uuid = mgr.ensure_mapping(b_plugin, t.tool_uid)
+        t.depends = translate_and_discover(b, tasks_b, t.depends, mgr)
+        t.followers = translate_and_discover(b, tasks_b, t.followers, mgr)
 
-        # 1. New Task? Just push it.
-        if not internal_uid:
-            internal_uid = mgr.create_mapping(a_plugin, a_task.ext_id)
-            a_task.uuid = internal_uid
-            _push_new_task(a_task, b, mgr, b_filter)
+    # 2. HYBRID SYNC PASS (Content + Available Links)
+    all_uuids = set(t.uuid for t in tasks_a.values()) | set(t.uuid for t in tasks_b.values())
+    pending_links = []  # Track (plugin, tool_uid, task_cif) for Pass 2
+
+    mapped_count = len(all_uuids)
+    if mapped_count > 0 and (len(tasks_a) == 0 or len(tasks_b) == 0):
+        typer.confirm(
+            f"⚠️ {a_plugin} returned 0 tasks but we have {mapped_count} mapped. "
+            "This looks like a connection issue. Proceed and DELETE all tasks on the other side?",
+            abort=True,
+        )
+
+    for uid in all_uuids:
+        eid_a = mgr.get_external_id(a_plugin, uid)
+        eid_b = mgr.get_external_id(b_plugin, uid)
+        t_a, t_b = tasks_a.get(eid_a), tasks_b.get(eid_b)
+        last_state = mgr.get_sync_state(uid)
+
+        # A. Handle Completion (Tombstoning)
+        if last_state and not (t_a and t_b):
+            if not t_a and t_b:  # Finished on A
+                if b.delete_task(eid_b):
+                    mgr.set_status(uid, "completed")
+            elif t_a and not t_b:  # Finished on B
+                if a.delete_task(eid_a):
+                    mgr.set_status(uid, "completed")
             continue
 
-        # 2. Existing Task? Fetch the "Last Known State" from DB
-        a_task.uuid = internal_uid
-        last_sync = mgr.get_sync_state(internal_uid)
+        # B. RETAINED: Conflict & Modification Detection
+        source, target_plugin, target_eid, target_filter = None, None, None, None
 
-        # Check if Source changed since last sync
-        src_changed = last_sync is None or a_task.get_content_hash() != last_sync["hash"]
+        if t_a and not eid_b:  # New on A -> B
+            source, target_plugin, target_eid, target_filter = t_a, b, None, b_filter
+        elif t_b and not eid_a:  # New on B -> A
+            source, target_plugin, target_eid, target_filter = t_b, a, None, a_filter
+        elif t_a and t_b:  # Conflict Check
+            dirty_a = t_a.get_content_hash() != (last_state["hash"] if last_state else None)
+            dirty_b = t_b.get_content_hash() != (last_state["hash"] if last_state else None)
 
-        if src_changed:
-            # 3. CONFLICT CHECK: Did the Destination change too?
-            print(f"DEBUG: Looking for name '{b_plugin}' with UUID '{internal_uid}'")
-            dst_ext_id = mgr.get_external_id(b_plugin, internal_uid)
-            src_ext_id = mgr.get_external_id(a_plugin, internal_uid)
-            raw_dst = b.fetch_one(dst_ext_id, b_filter)  # You'll need this method in plugin
-            current_dst_task = b.to_cif(raw_dst)
-
-            dst_changed = last_sync is None or current_dst_task.get_content_hash() != last_sync["hash"]
-
-            if dst_changed:
-                base_task = TaskCIR.from_dict(last_sync["data"]) if last_sync else None
-                typer.secho(f"⚠️ CONFLICT: {a_task.description} changed on both sides!", fg="red")
-                # 1. Perform the 3-way merge
-                merged_task = resolve_conflict_via_git(base_task, a_task, current_dst_task)
-
-                # 2. Update Source (Taskwarrior) if needed
-                _tmp = a_task.copy()
-                _tmp.update_from(merged_task)
-                if a_task.get_content_hash() != _tmp.get_content_hash():
-                    a.update_task(src_ext_id, _tmp, a_filter)
-
-                # 3. Update Destination (GitHub) if needed
-                _tmp = current_dst_task.copy()
-                _tmp.update_from(merged_task)
-                if current_dst_task.get_content_hash() != _tmp.get_content_hash():
-                    b.update_task(dst_ext_id, _tmp, b_filter)
-
-                # 4. Finalize state
-                mgr.update_sync_state(_tmp)
+            if dirty_a and dirty_b:
+                # RETAINED: Git-based 3-way merge
+                base_task = TaskCIR.from_dict(last_state["data"]) if last_state else None
+                mergedata = resolve_conflict_via_git(base_task, t_a, t_b)
+                source = t_a.copy()
+                source.update_from(mergedata)
+                if source.get_content_hash() != t_a.get_content_hash():
+                    a.update_task(eid_a, source, a_filter)
+                source = t_b.copy()
+                source.update_from(mergedata)
+                if source.get_content_hash() != t_b.get_content_hash():
+                    b.update_task(eid_b, source, b_filter)
+                mgr.update_sync_state(source)
+                # After a merge, we usually want to ensure links are full
+                pending_links.append((a, eid_a, source))
+                pending_links.append((b, eid_b, source))
+                continue
+            elif dirty_a:
+                source, target_plugin, target_eid, target_filter = t_a, b, eid_b, b_filter
+            elif dirty_b:
+                source, target_plugin, target_eid, target_filter = t_b, a, eid_a, a_filter
             else:
-                # --- CASE B: CLEAN UPDATE (Only source changed) ---
-                typer.echo(f"  ↑ Updating destination: {a_task.description[:40]}...")
+                continue  # Clean
 
-                # raw_out = b.from_cif(a_task)
-                # raw_out["ext_id"] = dst_ext_id
+        if source:
+            logging.debug(f"{source=} {target_plugin=} {target_eid=} {target_filter=}")
+            available_remote_ids = []
+            needs_second_pass = False
+            for dep_uid in source.depends:
+                remote_id = mgr.get_external_id(target_plugin.name, dep_uid)
+                if remote_id:
+                    available_remote_ids.append(remote_id)
+                else:
+                    needs_second_pass = True
 
-                success_id = b.update_task(dst_ext_id, current_dst_task.update_from(merged_task))
-                if success_id:
-                    mgr.update_sync_state(a_task)
+            # Temp task for Pass 1 (links only if they exist on target)
+            pass1_task = source.copy()
+            pass1_task.depends = available_remote_ids
 
-    typer.secho("✅ Sync complete.", fg="green", bold=True)
+            new_eid = target_plugin.update_task(target_eid, pass1_task, target_filter)
 
+            if not target_eid:
+                mgr.create_mapping(target_plugin.name, new_eid, uid)
+                target_eid = new_eid
 
-def _push_new_task(task: TaskCIR, dst_plugin, mgr: MappingManager, b_filter: str):
-    """Handles the first-time creation and state capture of a task."""
-    # 1. Translate to destination format
-    raw_out = dst_plugin.from_cif(task)
+            mgr.update_sync_state(source)
+            if needs_second_pass:
+                pending_links.append((target_plugin, target_eid, source))
 
-    # 2. Push to destination
-    new_ext_id = dst_plugin.send_raw(raw_out, b_filter)
-
-    if new_ext_id:
-        # 3. Save the Identity Mapping (Internal UUID <-> GitHub ID)
-        mgr.create_mapping(b_plugin, new_ext_id, task.uuid)
-
-        # 4. Save the State Snapshot (The Hash)
-        # This prevents the next sync from thinking it's a 'new change'
-        mgr.update_sync_state(task)
-        typer.echo(f"  + Created and state-tracked: {task.description[:40]}")
+    # 3. PASS 2: Supplemental Links
+    if pending_links:
+        typer.echo(f"🔗 Resolving {len(pending_links)} pending relationships...")
+        for plugin, tool_uid, task in pending_links:
+            plugin.update_relationships(tool_uid, task, mgr)
 
 
-def resolve_conflict_via_git(base_task: Optional[TaskCIR], p1_task: TaskCIR, p2_task: TaskCIR) -> TaskCIR:
+def resolve_conflict_via_git(base_task: Optional[TaskCIR], p1_task: TaskCIR, p2_task: TaskCIR) -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
         subprocess.run(["git", "init", "-q"], cwd=tmpdir)
         filename = "TASK.json"
         full_merged_path = os.path.join(tmpdir, filename)
 
-        def get_git_hash(task_obj):
+        def get_git_hash(task_obj: TaskCIR | None) -> str:
             # IMPORTANT: Use the encoder to ensure Enums don't crash the hasher
             content = task_obj.to_json(only_mergeable=True) if task_obj else "{}"
             res = subprocess.run(
@@ -182,73 +212,6 @@ def resolve_conflict_via_git(base_task: Optional[TaskCIR], p1_task: TaskCIR, p2_
                     raise typer.Abort()
 
 
-def sync_peers(p1, p2, target1, target2, mgr):
-    # 1. Fetch live data from both 'databases'
-    # We use 'pending' for TW and 'open' for GitHub to keep the set small
-    tasks1 = {t.ext_id: p1.to_cif(t) for t in p1.fetch_raw(target1)}
-    tasks2 = {t.ext_id: p2.to_cif(t) for t in p2.fetch_raw(target2)}
-
-    # 2. Get the set of all internal UUIDs we know about for these two targets
-    all_uuids = mgr.get_all_mapped_uuids(p1.name, p2.name)
-
-    for uid in all_uuids:
-        # Get last known state from our local DB
-        last_sync = mgr.get_sync_state(uid)
-
-        # Get live IDs for this specific task
-        id1 = mgr.get_external_id(p1.name, uid)
-        id2 = mgr.get_external_id(p2.name, uid)
-
-        # Get the actual TaskCIR objects
-        t1 = tasks1.get(id1)
-        t2 = tasks2.get(id2)
-
-        # Determine changes relative to the DB
-        p1_changed = t1 and (last_sync is None or t1.get_content_hash() != last_sync["hash"])
-        p2_changed = t2 and (last_sync is None or t2.get_content_hash() != last_sync["hash"])
-
-        if p1_changed and p2_changed:
-            # Conflict: Both peer databases diverged from our state DB
-            merged = resolve_conflict_3way(last_sync, t1, t2)
-            p1.update_task(merged)
-            p2.send_raw(p2.from_cif(merged) | {"ext_id": id2}, target2)
-            mgr.update_sync_state(merged)
-
-        elif p1_changed:
-            # Sync p1 -> p2
-            p2.send_raw(p2.from_cif(t1) | {"ext_id": id2}, target2)
-            mgr.update_sync_state(t1)
-
-        elif p2_changed:
-            # Sync p2 -> p1
-            p1.update_task(t2 | {"ext_id": id1})
-            mgr.update_sync_state(t2)
-
-
-def construct_tool_cmd(paths: dict, tmpdir: str) -> list:
-    """
-    Maps path keys to the specific argument structure of the chosen difftool.
-    paths keys: 'BASE', 'P1' (Local), 'P2' (Remote), 'MERGED' (Output)
-    """
-    config = get_config()
-    tool = config.get("difftool", "vimdiff")
-
-    def get_p(key):
-
-        val = paths[key]
-        file_path = val[1] if isinstance(val, (tuple, list)) else val
-        return os.path.basename(file_path)
-
-    # Extract raw paths from the tuple/dict structure
-    base = get_p("BASE")
-    p1 = get_p("P1")
-    p2 = get_p("P2")
-    merged_path = get_p("MERGED")
-    rv = ["git", "mergetool", "--tool=vimdiff", "--no-prompt", base, p1, p2, merged_path]
-    print(f"returning {rv}")
-    return rv
-
-
 from tabulate import tabulate
 
 config_app = typer.Typer(help="Manage UTS and Plugin configurations.")
@@ -256,7 +219,7 @@ app.add_typer(config_app, name="config")
 
 
 @config_app.command("list")
-def config_list():
+def config_list() -> None:
     """List all available keys, defaults, and current values."""
     manifest = get_full_manifest()
     current_config = load_user_config()  # Your existing JSON loader
@@ -306,6 +269,26 @@ def init():
     # If your class has an explicit init method:
     # mgr.initialize_tables()
     typer.secho("✅ Database initialized successfully.", fg="green")
+
+
+def translate_and_discover(plugin, task_dict, id_list, mgr):
+    """Translates Tool IDs to UUIDs; discovers unknown tasks via API."""
+    internal_uuids = []
+    for tid in id_list:
+        # 1. Search DB (includes 'completed' status items)
+        uid = mgr.get_internal_uuid(plugin.name, str(tid))
+
+        # 2. On-Demand Discovery if totally unknown
+        if not uid:
+            raw = plugin.fetch_one(str(tid))
+            if raw:
+                cif = plugin.to_cif(raw)
+                uid = mgr.ensure_mapping(plugin.name, cif.tool_uid)
+                cif.uuid = uid
+                task_dict[cif.tool_uid] = cif
+        if uid:
+            internal_uuids.append(uid)
+    return internal_uuids
 
 
 if __name__ == "__main__":
